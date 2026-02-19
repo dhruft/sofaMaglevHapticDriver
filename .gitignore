@@ -1,0 +1,19 @@
+# Prerequisites
+*.d
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+CMakeLists.txt
+
+# Build Directories
+build/
+bin/
+lib/
+
+# IDE settings (VS Code, CLion, etc.)
+.vscode/
+.idea/
+*.swp
+*.DS_Store
