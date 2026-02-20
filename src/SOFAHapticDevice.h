@@ -23,6 +23,13 @@ namespace sofa::component::controller
 class SOFAHapticDevice : public sofa::component::controller::Controller
 {
 public:
+    static SOFAHapticDevice* s_instance; // Pointer to the active component
+    
+    // Create a public thread-safe way to compute force
+    void computeHapticForce(double x, double y, double z, 
+                            double u, double v, double w,
+                            double q, double& fx, double& fy, double& fz);
+
     // CHANGE 3: Update the macro
     SOFA_CLASS(SOFAHapticDevice, sofa::component::controller::Controller);
 
@@ -57,8 +64,8 @@ public:
     //void onBeginAnimationStep(const double dt) override;
     void handleEvent(sofa::core::objectmodel::Event* event) override; 
 
-private:
-    std::vector<HapticLogEntry> m_logBuffer;
+// private:
+//     std::vector<HapticLogEntry> m_logBuffer;
 };
 
 } // namespace

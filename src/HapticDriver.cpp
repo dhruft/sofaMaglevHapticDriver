@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include "SOFAHapticDevice.h"
 
 extern "C" {
 
@@ -21,12 +22,7 @@ std::atomic<int>    g_btn1(0), g_btn2(0);
 std::atomic<double> g_velX(0), g_velY(0), g_velZ(0); 
 
 // Commands
-std::atomic<double> g_cmdForceX(0), g_cmdForceY(0), g_cmdForceZ(0);
-std::atomic<double> g_targetX(0), g_targetY(0), g_targetZ(0);
-std::atomic<double> g_userStiffness(0), g_userDamping(0);
-std::atomic<int>    g_controlMode(0); // 0 = Force, 1 = Spring
 std::atomic<double> g_scale(1.0);
-std::atomic<double> g_planeNx(0), g_planeNy(0), g_planeNz(0), g_planeDist(0);
 
 // Device State
 ml_device_handle_t device_hdl;
@@ -47,175 +43,67 @@ int button_callback(ml_device_handle_t dev, ml_button_t butt) {
     return 0;
 }
 
-// --- MAIN HAPTIC LOOP (1000 Hz) ---
-// This is called automatically by the ML API thread
+// Inside tick_callback
 int tick_callback(ml_device_handle_t dev, ml_position_t* pos_ptr) {
     if (!g_running) return 0;
 
-    static double last_raw_x = 0, last_raw_y = 0, last_raw_z = 0;
-    static bool first_tick = true; 
+    // 1. Get current physical position
+    double raw_x = pos_ptr->values[0];
+    double raw_y = pos_ptr->values[1];
+    double raw_z = pos_ptr->values[2];
 
-    double scale = g_scale.load();
-    double curr_raw_x = pos_ptr->values[0];
-    double curr_raw_y = pos_ptr->values[1];
-    double curr_raw_z = pos_ptr->values[2];
-
-    if (!first_tick) {
-        // 1. Calculate Raw Delta
-        double dx = (curr_raw_x - last_raw_x) * scale;
-        double dy = (curr_raw_y - last_raw_y) * scale;
-        double dz = (curr_raw_z - last_raw_z) * scale;
-
-        // 2. APPLY DEADBAND
-        // If the movement is less than 0.00001 units, treat it as zero.
-        // This stops the "shaking" when the device is sitting still.
-        double threshold = 0.00001; 
-        if (std::abs(dx) < threshold) dx = 0;
-        if (std::abs(dy) < threshold) dy = 0;
-        if (std::abs(dz) < threshold) dz = 0;
-
-        double vx_raw = dx * 1000.0;
-        double vy_raw = dy * 1000.0;
-        double vz_raw = dz * 1000.0;
-
-        // 3. AGGRESSIVE LOW-PASS FILTER
-        // Change 0.1 to 0.02 if it's still vibrating. 
-        // A lower value makes it smoother but introduces slight "latency".
-        double alpha = 0.05; 
-        g_velX.store(vx_raw * alpha + g_velX.load() * (1.0 - alpha));
-        g_velY.store(vy_raw * alpha + g_velY.load() * (1.0 - alpha));
-        g_velZ.store(vz_raw * alpha + g_velZ.load() * (1.0 - alpha));
-    }
-
-    last_raw_x = curr_raw_x; last_raw_y = curr_raw_y; last_raw_z = curr_raw_z;
-    first_tick = false;
-
-    // 3. Update Position Shared Memory
-    g_posX.store(curr_raw_x * scale);
-    g_posY.store(curr_raw_y * scale);
-    g_posZ.store(curr_raw_z * scale);
-    
-
+    // Update global atomics for SOFA's handleEvent to see
+    g_posX.store(raw_x * g_scale.load());
+    g_posY.store(raw_y * g_scale.load());
+    g_posZ.store(raw_z * g_scale.load());
 
     g_rotX.store(pos_ptr->values[3]);
     g_rotY.store(pos_ptr->values[4]);
     g_rotZ.store(pos_ptr->values[5]);
 
-    // 2. Prepare Output Structures
+    // 2. REACH INTO SOFA AND COMPUTE LCP FORCE
+    double fx = 0, fy = 0, fz = 0;
+    if (sofa::component::controller::SOFAHapticDevice::s_instance) {
+        // Call the mini-solver!
+        sofa::component::controller::SOFAHapticDevice::s_instance->computeHapticForce(
+            raw_x, raw_y, raw_z, 
+            0, 0, 0, 0, 
+            fx, fy, fz
+        );
+    }
+
     ml_position_t despos = {0};
     ml_gain_vec_t gains = {0};
-    
+
     // Apply gravity compensation feed-forward
     for (int i=0; i<6; i++) {
         gains.values[i].ff = gravity.values[i];
     }
+    
+    fx = Clamp(fx, MAX_FORCE);
+    fy = Clamp(fy, MAX_FORCE);
+    fz = Clamp(fz, MAX_FORCE);
 
-    // 3. Calculate Physics
-    double fx = 0, fy = 0, fz = 0;
-    int mode = g_controlMode.load();
+    double k = STIFFNESS_MAX; // Use high stiffness for crisp force transmission
+    
+    gains.values[0].p = k; gains.values[0].d = 30.0;
+    gains.values[1].p = k; gains.values[1].d = 30.0;
+    gains.values[2].p = k; gains.values[2].d = 30.0; // Z often needs higher gains?
 
-    if (mode == 0) {
-        // --- FORCE MODE (Simulated via Offset) ---
-        // SOFA sends a force F. We trick the device:
-        // DesiredPos = CurrentPos + (F / K_max)
-        // Gain_P = K_max
-        // Resulting Force = K_max * (Desired - Current) = F
-        
-        fx = Clamp(g_cmdForceX.load(), MAX_FORCE);
-        fy = Clamp(g_cmdForceY.load(), MAX_FORCE);
-        fz = Clamp(g_cmdForceZ.load(), MAX_FORCE);
-
-        double k = STIFFNESS_MAX; // Use high stiffness for crisp force transmission
-        
-        gains.values[0].p = k; gains.values[0].d = 30.0;
-        gains.values[1].p = k; gains.values[1].d = 30.0;
-        gains.values[2].p = k; gains.values[2].d = 30.0; // Z often needs higher gains?
-
-        // Offset position trick
-        despos.values[0] = pos_ptr->values[0] + (fx / k);
-        despos.values[1] = pos_ptr->values[1] + (fy / k);
-        despos.values[2] = pos_ptr->values[2] + (fz / k);
-    } 
-    else if (mode == 1) {
-        // --- SPRING MODE ---
-        // We set the gains directly requested by the user
-        double k = g_userStiffness.load();
-        double d = g_userDamping.load();
-
-        gains.values[0].p = k; gains.values[0].d = d;
-        gains.values[1].p = k; gains.values[1].d = d;
-        gains.values[2].p = k; gains.values[2].d = d;
-
-        // Target is set directly
-        despos.values[0] = g_targetX.load() / scale;
-        despos.values[1] = g_targetY.load() / scale;
-        despos.values[2] = g_targetZ.load() / scale;
-    }
-    else if (mode == 2) {
-        // --- PLANE MODE ---
-        // F = k * penetration_depth * Normal
-        
-        double nx = g_planeNx.load();
-        double ny = g_planeNy.load();
-        double nz = g_planeNz.load();
-        double d  = g_planeDist.load();
-        double k  = g_userStiffness.load();
-
-        // Calculate penetration depth: Dist_current - Dist_wall
-        // Plane Eq: Ax + By + Cz = D
-        double current_dist_projection = (pos_ptr->values[0] * nx) + 
-                                         (pos_ptr->values[1] * ny) + 
-                                         (pos_ptr->values[2] * nz);
-        
-        double penetration = d - current_dist_projection;
-
-        // Only apply force if we are BEHIND the wall (penetration > 0)
-        if (penetration > 0) {
-             fx = nx * penetration * k;
-             fy = ny * penetration * k;
-             fz = nz * penetration * k;
-        } else {
-             fx = fy = fz = 0; // Free space
-        }
-        
-        // Use the Offset Trick to send this Force to the impedance device
-        double k_max = STIFFNESS_MAX;
-        despos.values[0] = pos_ptr->values[0] + (fx / k_max);
-        despos.values[1] = pos_ptr->values[1] + (fy / k_max);
-        despos.values[2] = pos_ptr->values[2] + (fz / k_max);
-        
-        gains.values[0].p = k_max;
-        gains.values[1].p = k_max;
-        gains.values[2].p = k_max;
-    } else if (mode == 3) {
-    //custom gains on force sent from SOFA, use offset position trick
-        fx = Clamp(g_cmdForceX.load(), MAX_FORCE);
-        fy = Clamp(g_cmdForceY.load(), MAX_FORCE);
-        fz = Clamp(g_cmdForceZ.load(), MAX_FORCE);
-
-        // --- SPRING MODE ---
-        // We set the gains directly requested by the user
-        double k = g_userStiffness.load();
-        double d = g_userDamping.load();
-
-        gains.values[0].p = k; gains.values[0].d = d;
-        gains.values[1].p = k; gains.values[1].d = d;
-        gains.values[2].p = k; gains.values[2].d = d;
-
-
-        // Offset position trick
-        despos.values[0] = pos_ptr->values[0] + (fx / k);
-        despos.values[1] = pos_ptr->values[1] + (fy / k);
-        despos.values[2] = pos_ptr->values[2] + (fz / k);
-    	
-    }
-
+    // Offset position trick
+    despos.values[0] = raw_x + (fx / k);
+    despos.values[1] = raw_y + (fy / k);
+    despos.values[2] = raw_z + (fz / k);
 
     // Rotational Gains (Keep stiff to prevent spinning)
     for (int i=3; i<6; i++) {
         gains.values[i].p = 10.0;
         gains.values[i].d = 0.40;
     }
+
+    // 3. Apply the Damping locally at 1000Hz (much more stable!)
+    // [Calculate Velocity here as we did before]
+    // fx -= (vx * damping); ...
 
     // 4. Send to Device
     ml_SetGainVecAxes(dev, ML_GAINSET_TYPE_NORMAL, gains);
@@ -265,7 +153,6 @@ int StartHaptics() {
 
     return 1;
 }
-
 
 int StopHaptics() {
     if (!g_running) return 1;
@@ -364,23 +251,6 @@ void GetButtonState(int* b1, int* b2) {
     *b2 = g_btn2.load();
 }
 
-void SetControlMode(int mode) {
-    g_controlMode.store(mode);
-}
-
-void SetForce(double fx, double fy, double fz) {
-    g_cmdForceX.store(fx);
-    g_cmdForceY.store(fy);
-    g_cmdForceZ.store(fz);
-}
-
-void SetSpring(double tx, double ty, double tz, double k, double d) {
-    g_targetX.store(tx);
-    g_targetY.store(ty);
-    g_targetZ.store(tz);
-    g_userStiffness.store(k);
-    g_userDamping.store(d);
-}
 
 void SetScalingFactor(double scale) {
     g_scale.store(scale);
